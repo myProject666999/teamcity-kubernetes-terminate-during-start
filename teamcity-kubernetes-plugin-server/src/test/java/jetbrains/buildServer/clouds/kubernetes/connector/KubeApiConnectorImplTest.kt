@@ -47,6 +47,37 @@ class KubeApiConnectorImplTest : BaseTestCase() {
     }
 
     @Test
+    public fun delete_pod_passes_grace_period(){
+        val client = FakeKubeClient()
+        val connector = createConnector(client)
+
+        then(connector.deletePod("some-pod", 30)).isTrue
+        then(client.myDeletedPodName).isEqualTo("some-pod")
+        then(client.myDeletedPodGracePeriodWasSet).isTrue
+        then(client.myDeletedPodGracePeriod).isEqualTo(30L)
+    }
+
+    @Test
+    public fun delete_pod_without_grace_period_does_not_set_it(){
+        val client = FakeKubeClient()
+        val connector = createConnector(client)
+
+        then(connector.deletePod("some-pod", 0)).isTrue
+        then(client.myDeletedPodName).isEqualTo("some-pod")
+        then(client.myDeletedPodGracePeriodWasSet).isFalse
+    }
+
+    private fun createConnector(client: FakeKubeClient): KubeApiConnectorImpl {
+        val timeService = MockTimeService()
+        val credentialsFactory = KubernetesCredentialsFactoryImpl(
+            KubeAuthStrategyProviderImpl(timeService, Mockito.mock(ProjectManager::class.java)),
+            Mockito.mock(ProjectManager::class.java))
+        return object: KubeApiConnectorImpl("kube-111", apiConnection, FakeAuthStrategy(timeService), credentialsFactory){
+            override fun createClient(config: Config): KubernetesClient = client
+        }
+    }
+
+    @Test
     public fun check_connection_refreshed(){
         val initialClient = FakeKubeClient()
         val errorMessage = "Failure executing: GET at: https://localhost:12345/api/v1/namespaces/test-namespace/pods?labelSelector=teamcity-cloud-image%3D0,teamcity-cloud-profile%3Dkube-4. Message: Unauthorized! Token may have expired! Please log-in again. Unauthorized."

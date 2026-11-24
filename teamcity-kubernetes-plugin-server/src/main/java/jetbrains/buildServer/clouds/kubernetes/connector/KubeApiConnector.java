@@ -26,6 +26,16 @@ public interface KubeApiConnector extends Closeable {
 
     PersistentVolumeClaim createPVC(@NotNull PersistentVolumeClaim pvc);
 
+    /**
+     * Deletes the given pod.
+     *
+     * @param gracePeriod the pod's termination grace period in seconds, 0 to delete immediately
+     * @return false if the pod does not exist in the cluster, i.e. it is already deleted; true if the
+     * deletion was accepted by the cluster. Any failure other than "pod not found" is reported as a
+     * {@link io.fabric8.kubernetes.client.KubernetesClientException} instead of returning false.
+     * Callers must treat false as a successful deletion: absent pod means the goal of terminating the
+     * instance is already reached.
+     */
     boolean deletePod(@NotNull String podName, long gracePeriod);
 
     @NotNull
@@ -45,6 +55,13 @@ public interface KubeApiConnector extends Closeable {
     @NotNull
     Collection<String> listDeployments();
 
+    /**
+     * Deletes the named PVC.
+     *
+     * @return false if the PVC does not exist in the cluster, i.e. it is already deleted; true if the
+     * deletion was accepted by the cluster. Any failure other than "PVC not found" is reported as a
+     * {@link io.fabric8.kubernetes.client.KubernetesClientException} instead of returning false.
+     */
     boolean deletePVC(@NotNull String name);
 
     void invalidate();

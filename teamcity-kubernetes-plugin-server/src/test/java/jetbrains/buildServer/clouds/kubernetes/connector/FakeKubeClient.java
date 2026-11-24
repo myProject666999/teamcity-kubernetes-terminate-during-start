@@ -10,12 +10,19 @@ import io.fabric8.kubernetes.client.dsl.PodResource;
 import io.fabric8.kubernetes.client.dsl.base.BaseOperation;
 import io.fabric8.kubernetes.client.dsl.base.OperationContext;
 import java.io.IOException;
+import java.lang.reflect.Proxy;
 import java.util.concurrent.ExecutionException;
 
 public class FakeKubeClient extends DefaultKubernetesClient {
 
   public KubernetesClientException myException;
 
+  /**
+   * Name of the pod passed to the last delete request, and the grace period it was requested with.
+   */
+  public String myDeletedPodName;
+  public long myDeletedPodGracePeriod;
+  public boolean myDeletedPodGracePeriodWasSet;
 
   @Override
   public MixedOperation<Pod, PodList, PodResource<Pod>> pods() {
@@ -27,7 +34,35 @@ public class FakeKubeClient extends DefaultKubernetesClient {
       protected Object handleCreate(Object resource) {
         return new Pod();
       }
+
+      @Override
+      public PodResource<Pod> withName(String name) {
+        return createRecordingPodResource(name);
+      }
     };
+  }
+
+  /**
+   * A dynamic proxy for the pod resource: PodResource has too many methods to implement by hand, and only
+   * withGracePeriod and delete are relevant for the delete request.
+   */
+  private PodResource<Pod> createRecordingPodResource(String name) {
+    return (PodResource<Pod>) Proxy.newProxyInstance(
+            getClass().getClassLoader(),
+            new Class<?>[]{PodResource.class},
+            (proxy, method, args) -> {
+              switch (method.getName()) {
+                case "delete":
+                  myDeletedPodName = name;
+                  return true;
+                case "withGracePeriod":
+                  myDeletedPodGracePeriod = (Long) args[0];
+                  myDeletedPodGracePeriodWasSet = true;
+                  return proxy;
+                default:
+                  throw new UnsupportedOperationException(method.getName() + " is not used by the delete request");
+              }
+            });
   }
 
   private static class MyOperation extends BaseOperation{

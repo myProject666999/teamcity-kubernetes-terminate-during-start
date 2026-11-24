@@ -93,7 +93,15 @@ public class KubeApiConnectorImpl implements KubeApiConnector {
 
     @Override
     public boolean deletePod(@NotNull String podName, long gracePeriod) {
-        return withKubernetesClient(kubernetesClient -> kubernetesClient.pods().withName(podName).delete());
+        return withKubernetesClient(kubernetesClient -> {
+            // fabric8 returns false only when the pod is already absent (HTTP 404) and throws on any
+            // other failure, so a false result means the pod does not exist anymore, not that the
+            // deletion failed to take effect. See KubeApiConnector#deletePod.
+            if (gracePeriod > 0) {
+                return kubernetesClient.pods().withName(podName).withGracePeriod(gracePeriod).delete();
+            }
+            return kubernetesClient.pods().withName(podName).delete();
+        });
     }
 
     @NotNull

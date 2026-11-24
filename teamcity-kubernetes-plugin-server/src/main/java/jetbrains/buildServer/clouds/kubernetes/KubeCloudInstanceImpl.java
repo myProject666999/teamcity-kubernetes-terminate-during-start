@@ -35,18 +35,69 @@ public class KubeCloudInstanceImpl implements KubeCloudInstance {
     private volatile InstanceStatus myInstanceStatus = InstanceStatus.SCHEDULED_TO_START;
     private volatile Date myStartDate;
 
+    private volatile boolean myTerminationRequested = false;
+
+    /**
+     * Guards the creation/termination handshake: {@link #myCreationCompleted} and {@link #myCleanupClaimed}
+     * are plain fields protected by this lock, so that exactly one side becomes responsible for deleting
+     * the pod and the PVC.
+     */
+    private final Object myLifecycleLock = new Object();
+    private boolean myCreationCompleted;
+    private boolean myCleanupClaimed;
+
     private CloudErrorInfo myCurrentError;
     private Date myCreationTime;
 
     public KubeCloudInstanceImpl(@NotNull KubeCloudImage kubeCloudImage, @NotNull Pod pod) {
+        this(kubeCloudImage, pod, true);
+    }
+
+    /**
+     * @param creationCompleted true if the Pod passed to this constructor already exists in the cluster,
+     *                          so no asynchronous creation task is going to run for this instance.
+     *                          Pass false for an instance registered before its Pod has been created.
+     */
+    public KubeCloudInstanceImpl(@NotNull KubeCloudImage kubeCloudImage, @NotNull Pod pod, boolean creationCompleted) {
         myKubeCloudImage = kubeCloudImage;
         myPod = pod;
+        myCreationCompleted = creationCompleted;
         final TimeZone utc = TimeZone.getTimeZone("UTC");
         myPodStartTimeFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm");
         myPodStartTimeFormat.setTimeZone(utc);
         myPodTransitionTimeFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
         myPodTransitionTimeFormat.setTimeZone(utc);
         myCreationTime = new Date();
+    }
+
+    @Override
+    public void requestTermination() {
+        myTerminationRequested = true;
+    }
+
+    @Override
+    public boolean isTerminationRequested() {
+        return myTerminationRequested;
+    }
+
+    @Override
+    public boolean completeCreation() {
+        synchronized (myLifecycleLock) {
+            myCreationCompleted = true;
+            if (!myTerminationRequested || myCleanupClaimed) return false;
+            myCleanupClaimed = true;
+            return true;
+        }
+    }
+
+    @Override
+    public boolean claimCleanupForTermination() {
+        synchronized (myLifecycleLock) {
+            if (!myCreationCompleted) return false; // the creation task will clean up by itself
+            if (myCleanupClaimed) return false;
+            myCleanupClaimed = true;
+            return true;
+        }
     }
 
     @NotNull

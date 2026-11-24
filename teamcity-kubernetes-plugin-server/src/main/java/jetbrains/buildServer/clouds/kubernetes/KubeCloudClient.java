@@ -93,31 +93,97 @@ public class KubeCloudClient implements CloudClientEx {
         if (pvc != null){
             KubeTeamCityLabels.addCustomLabel(podTemplate, KubeTeamCityLabels.POD_PVC_NAME, pvc.getMetadata().getName());
         }
-        KubeCloudInstance instance = new KubeCloudInstanceImpl(kubeCloudImage, podTemplate);
+        KubeCloudInstance instance = new KubeCloudInstanceImpl(kubeCloudImage, podTemplate, false);
         kubeCloudImage.addStartedInstance(instance);
         // Once instance added to the kubeCloudImage, we could unlock name from name generator.
         myNameGenerator.vmNameSaved(instanceName);
         myExecutorService.submit(() -> {
             Pod newPod = null;
             PersistentVolumeClaim newPVC = null;
+            RuntimeException failure = null;
+            final boolean cleanupOwnedByCreation;
             try {
                 if (pvc !=null){
                     newPVC = myApiConnector.createPVC(pvc);
                 }
                 newPod = myApiConnector.createPod(podTemplate);
-                instance.updateState(newPod);
             } catch (KubeCloudException | KubernetesClientException ex){
-                LOG.warnAndDebugDetails("An error occurred while starting new instance", ex);
+                failure = ex;
+            } finally {
+                // Exactly one of the creation and the termination task gets to delete the pod and the PVC:
+                // the termination task may have run before this task (the executor does not guarantee the
+                // order), and then it deliberately left the cleanup to the task which creates the pod.
+                cleanupOwnedByCreation = instance.completeCreation();
+            }
+
+            if (failure != null) {
+                LOG.warnAndDebugDetails("An error occurred while starting new instance", failure);
                 if (newPod == null && newPVC != null && newPVC.getMetadata() != null) {
                     LOG.warn("a PVC '" + newPVC.getMetadata().getName() +"' was created as a part of the POD '"+podTemplate.getMetadata().getName()+"' creation. Pod failed to create (see above). Will now delete the PVC as well.");
                     myApiConnector.deletePVC(newPVC.getMetadata().getName());
                 }
-                instance.setStatus(InstanceStatus.ERROR);
-                instance.setError(new CloudErrorInfo("Instance cannot be started", ex.getMessage(), ex));
-                throw ex;
+                if (cleanupOwnedByCreation || instance.isTerminationRequested()) {
+                    // No pod was left in the cluster, so the requested termination is complete.
+                    instance.setError(null);
+                    instance.setStatus(InstanceStatus.STOPPED);
+                } else {
+                    instance.setStatus(InstanceStatus.ERROR);
+                    instance.setError(new CloudErrorInfo("Instance cannot be started", failure.getMessage(), failure));
+                }
+                throw failure;
+            }
+
+            if (cleanupOwnedByCreation) {
+                LOG.info("Instance '" + instance.getName() + "' was requested to terminate while its pod was being created. Deleting the just created pod.");
+                completeTermination(instance, newPod, newPVC);
+            } else {
+                instance.updateState(newPod);
             }
         });
         return instance;
+    }
+
+    /**
+     * Deletes the pod and the PVC of the given instance and marks it STOPPED. Both deletions are tolerant
+     * to already absent resources: this cleanup runs after a termination was requested, and the creation
+     * and termination tasks may race with each other.
+     */
+    private void completeTermination(@NotNull KubeCloudInstance instance,
+                                     @Nullable Pod createdPod,
+                                     @Nullable PersistentVolumeClaim createdPVC) {
+        try {
+            deletePodAndPVC(instance, createdPod, createdPVC);
+            instance.setError(null);
+            instance.setStatus(InstanceStatus.STOPPED);
+        } catch (KubernetesClientException | CloudException ex){
+            // CloudException is thrown by the connector for programming/infrastructure errors, e.g. blocked
+            // credentials. Never let it escape: the task is run by an executor which would swallow it and
+            // leave the instance in STOPPING forever.
+            LOG.warnAndDebugDetails("Failed to delete the pod of instance '" + instance.getName() + "'", ex);
+            instance.setStatus(InstanceStatus.ERROR);
+            instance.setError(new CloudErrorInfo("Failed to terminate instance", ex.getMessage(), ex));
+        }
+    }
+
+    private void deletePodAndPVC(@NotNull KubeCloudInstance instance,
+                                 @Nullable Pod createdPod,
+                                 @Nullable PersistentVolumeClaim createdPVC) {
+        final String podName = createdPod != null && createdPod.getMetadata() != null
+                ? createdPod.getMetadata().getName()
+                : instance.getName();
+        final String pvcName = createdPVC != null && createdPVC.getMetadata() != null
+                ? createdPVC.getMetadata().getName()
+                : instance.getPVCName();
+        if (!myApiConnector.deletePod(podName, getGracePeriod())) {
+            LOG.debug("Pod '" + podName + "' is already absent, nothing to delete");
+        }
+        if (pvcName != null && !myApiConnector.deletePVC(pvcName)) {
+            LOG.debug("PersistentVolumeClaim '" + pvcName + "' is already absent, nothing to delete");
+        }
+    }
+
+    private static long getGracePeriod() {
+        return TeamCityProperties.getLong(TEAMCITY_KUBE_PODS_GRACE_PERIOD, 0);
     }
 
     @Override
@@ -128,25 +194,24 @@ public class KubeCloudClient implements CloudClientEx {
     @Override
     public void terminateInstance(@NotNull CloudInstance cloudInstance) {
         final KubeCloudInstance kubeCloudInstance = (KubeCloudInstance) cloudInstance;
+        // The flag must be set before the task is submitted: the creation task of the same instance may
+        // already be running on another executor thread and consults the flag after its createPod call.
+        kubeCloudInstance.requestTermination();
         kubeCloudInstance.setStatus(InstanceStatus.SCHEDULED_TO_STOP);
         myExecutorService.submit(() -> {
-            long gracePeriod = TeamCityProperties.getLong(TEAMCITY_KUBE_PODS_GRACE_PERIOD, 0);
             kubeCloudInstance.setStatus(InstanceStatus.STOPPING);
             try{
-                int failedDeleteAttempts = 0;
-                final String pvcName = kubeCloudInstance.getPVCName();
-                while (!myApiConnector.deletePod(kubeCloudInstance.getName(), gracePeriod)){
-                    failedDeleteAttempts++;
-                    if(failedDeleteAttempts == 3) throw new KubeCloudException("Failed to delete pod " + kubeCloudInstance.getName());
+                if (kubeCloudInstance.claimCleanupForTermination()) {
+                    completeTermination(kubeCloudInstance, null, null);
+                } else {
+                    // The creation task owns the cleanup: it has not created the pod yet, so the pod may not
+                    // exist at all, and it will delete the resources it creates because the termination
+                    // request flag is already set by the time it finishes.
+                    LOG.debug("Instance '" + kubeCloudInstance.getName() + "' is still being created; the creation task will delete its pod");
+                    kubeCloudInstance.setError(null);
+                    kubeCloudInstance.setStatus(InstanceStatus.STOPPED);
                 }
-                failedDeleteAttempts = 0;
-                while (pvcName != null && !myApiConnector.deletePVC(pvcName)){
-                    failedDeleteAttempts++;
-                    if(failedDeleteAttempts == 3) throw new KubeCloudException("Failed to delete PersistentVolumeClaim " + pvcName);
-                }
-                kubeCloudInstance.setError(null);
-                kubeCloudInstance.setStatus(InstanceStatus.STOPPED);
-            } catch (KubernetesClientException ex){
+            } catch (KubernetesClientException | CloudException ex){
                 kubeCloudInstance.setStatus(InstanceStatus.ERROR);
                 kubeCloudInstance.setError(new CloudErrorInfo("Failed to terminate instance", ex.getMessage(), ex));
             }
